@@ -17,7 +17,7 @@
 | PCB | 1 | 0.00 | http://xxxx |
 | 2.51寸 ST7789液晶屏 SPI接口 | 1 | 26.80 | http://xxxx |
 | RP2040 Tiny 开发板模块 | 1 | 17.48 | http://xxxx |
-| 74LVC245APW 8位三态同相缓冲器 | 3 | 5.82 | http://xxxx |
+| 74LVC245APW 三态同相8位总线缓冲器 | 3 | 5.82 | http://xxxx |
 | STC8G1K08A 单片机 | 1 | 2.32 | http://xxxx |
 | TTP223-BA6 电容触摸开关 | 1 | 2.00 | http://xxxx |
 | FPC连接器 15Pin 0.5mm 1.0H 双面接 | 1 | 0.40 | http://xxxx |
