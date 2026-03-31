@@ -40,4 +40,4 @@ STC8G1K08A单片机检测触摸信号和控制PWM硬件，驱动LCD的背光。T
 5. 如此循环永不停歇。
 
 ## 为何不使用RP2040输出PWM驱动LCD的背光？为何不使用RP2040实现触摸检测？
-因为GPIO不够用了……
+因为GPIO不够用了……RP2040 Tiny开发板只对外引出了20个GPIO，再加上2个用于跳线的GPIO，一共22个。而采集GBC的LCD总线数据，需要15个RGB+VSync+HSync+CLK=18个GPIO；SPI接口的LCD至少需要SCK+SDA+DC=3个GPIO；检测电池电压又需要1个ADC Input，正好将所有GPIO全部用光，再也拿不出任何多余的GPIO来驱动LCD背光和检测触摸了。
