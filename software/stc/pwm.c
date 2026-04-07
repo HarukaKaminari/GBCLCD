@@ -1,288 +1,186 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include <string.h>
 
-/*******************************************************************************
- * 文件名: pwm.c
- * 芯片:   STC8G1K08A (SOP8封装)
- * 编译器: Keil C51 (MDK-251)
- * 系统频率: 24MHz (内部高精度RC振荡器，通过STC-ISP烧录时配置)
- *
- * 功能说明:
- *   本文件实现了一路PWM输出及一路外部中断按键输入：
- *   ① PWM输出 : 统一输出到P3.3(Pin 8)，通过宏开关 USE_HW_PWM 选择实现方式：
- *              USE_HW_PWM已定义 → 使用PCA(CCP1)硬件PWM（适用于STC8G1K08A）
- *              USE_HW_PWM未定义 → 使用Timer0软件PWM（适用于STC8G1K08，无PCA）
- *              两种模式硬件电路完全相同，仅需切换宏即可。
- *   ② 外部中断: 使用INT0监测P3.2(Pin 7)上升沿，每次触发后PWM档位循环递进：
- *              0% → 10% → 20% → ... → 90% → 100% → 0%（回到起点）
- *
- *   CCP引脚说明：根据STC8G1K08A官方手册，P_SW1[5:4]=CCP_S[1:0]：
- *     CCP_S=00: CCP0→P3.2, CCP1→P3.3, CCP2→P5.4
- *     CCP_S=01: CCP0→P3.1, CCP1→P3.3, CCP2→P5.4
- *     CCP_S=10: CCP0→P3.2, CCP1→P3.3, CCP2→P5.5
- *   P3.2已用作INT0按键，P3.0/P3.1预留UART，P5.4为RST。
- *   三种映射中CCP1均指向P3.3，为SOP8唯一可用的CCP硬件PWM引脚。
- *   本例选CCP_S=00（上电默认值），通过CCP1在P3.3输出硬件PWM。
- *
- *   低功耗策略:
- *   PWM启动后，CPU进入 IDLE（空闲）模式以降低功耗。
- *   - 硬件PWM模式：PCA在IDLE下自主运行，CPU全程休眠，功耗最低（~0.5mA）。
- *   - 软件PWM模式：Timer0在IDLE下每1ms唤醒CPU翻转P3.3，功耗略高（~1.0mA）。
- *   - 外部中断：INT0在IDLE下可唤醒CPU，ISR检测上升沿后设置换档标志。
- *   - 不可使用STOP（停机）模式，STOP会停止所有时钟，PCA和Timer0均停止。
- *
- * SOP8引脚分配图（依据官方手册）:
- *               ┌──────────┐
- *         P5.4 ─┤1   __  8 ├─ P3.3 ← PWM输出(硬件/软件共用)
- *          VCC ─┤2  /  \ 7 ├─ P3.2 ← 按键输入  (INT0)
- *         P5.5 ─┤3  \__/ 6 ├─ P3.1 (预留UART TX)
- *          GND ─┤4       5 ├─ P3.0 (预留UART RX)
- *               └──────────┘
- *
- * 引脚功能说明:
- *   Pin 1  P5.4 : 复位引脚（RST，默认），通过STC-ISP可配置为普通GPIO
- *   Pin 3  P5.5 : 未使用（准双向口，弱上拉固定高电平，防浮空漏电）
- *   Pin 5  P3.0 : 预留UART RX（不配置，保留以备串口调试使用）
- *   Pin 6  P3.1 : 预留UART TX（不配置，保留以备串口调试使用）
- *   Pin 7  P3.2 : 按键输入（INT0外部中断），上升沿触发档位切换
- *                 模式：准双向口（内置弱上拉），按键接GND，空闲时引脚为高电平
- *                 按下→低电平（下降沿，忽略），松开→高电平（上升沿，触发换档）
- *   Pin 8  P3.3 : PWM输出（硬件模式由PCA CCP1驱动，软件模式由Timer0中断翻转）
- *
- * 作者: GitHub Copilot
- * 日期: 2026-03-24
- *******************************************************************************/
+#include "pico/stdlib.h"
+#include "pico/time.h"
+#include "pico/unique_id.h"
+#include "hardware/spi.h"
+#include "hardware/clocks.h"
+#include "hardware/pll.h"
+#include "hardware/timer.h"
+#include "hardware/sync.h"
+#include "hardware/resets.h"
 
-#include <STC8G.H>   /* Keil C51 STC8G系列头文件，需从STC官网下载并添加到Keil库路径 */
-#include <intrins.h>  /* 提供 _nop_() 内联函数，用于IDLE进入后的流水线延迟处理 */
+#include "ST7789.h"
+#include "TestParticle.h"
+#include "Capture.h"
+#include "Backlight.h"
+#include "Setting.h"
+#include "BatMonitor.h"
+#include "Touch.h"
 
-/*******************************************************************************
- * ① 系统参数宏定义
- *******************************************************************************/
+#include "build/generated/border0.h"
+#include "build/generated/border1.h"
 
-/* 内部IRC振荡器频率，由STC-ISP烧录时配置，代码运行期间保持不变           */
-#define FOSC            24000000UL   /* IRC输出：24 MHz（不在代码中修改）  */
 
-/* 系统时钟分频系数（写入 CLKDIV 寄存器，SYSCLK = FOSC / CLKDIV_N）
- *   增大此值可降低功耗，但所有外设速度同步降低（需相应调整时序参数）。
- *   可选值：1, 2, 4, 8, 16, 32, 64（避免写0，效果因型号而异）           */
-#define CLKDIV_N        4            /* 分频系数4 → SYSCLK = 24/4 = 6MHz  */
+#define LE2BE(v)    ( \
+    (uint16_t)((((v) >> 8) & 0xFF) | (((v) & 0xFF) << 8))\
+)
+#define RGB(r, g, b)    ( \
+    (uint16_t)((((r) >> 3) << 11) | (((g) >> 2) << 5) | (((b) >> 3) << 0)) \
+)
 
-/* 实际系统运行时钟：CPU 和所有片上外设（PCA、Timer等）均使用此频率       */
-#define SYSCLK          (FOSC / CLKDIV_N)   /* 6 MHz */
 
-/*******************************************************************************
- * ① PWM模式选择宏开关
- *
- * USE_HW_PWM = 已定义 → 使用PCA(CCP1)硬件PWM（STC8G1K08A，后缀带A，有PCA模块）
- *              未定义 → 使用Timer0软件PWM（STC8G1K08，后缀无A，无PCA模块）
- *
- * 两种模式均通过P3.3(SOP8 Pin 8)输出，硬件电路无需任何改动。
- * 统一API：PWM_Init()、PWM_SetGear()、PWM_SetDuty()，内部自动选择实现。
- *******************************************************************************/
-#define USE_HW_PWM   /* 注释此行切换为软件PWM（适用于无PCA的STC8G1K08） */
+// 边框
+static const uint16_t* borders[] = {
+    border0, border1,
+};
+// 扫描线颜色
+static const uint16_t scanlineColors[256] = {[0 ... 255] = RGB(0x80, 0x80, 0x80)};
 
-#ifdef USE_HW_PWM
-/*******************************************************************************
- * ② PCA 时钟源选择（写入 CMOD 的 [3:1] 三位，即 CPS2~CPS0）
- *
- * PCA时钟源决定了硬件PWM的基准频率：
- *   PWM频率 = PCA时钟频率 / 256  (8位PWM，周期=256个PCA时钟)
- *
- *   时钟源宏      | CPS[2:0] | PCA时钟(@SYSCLK=6MHz)  | PWM频率
- *   -------------|----------|-----------------------|----------
- *   PCA_CLK_12   |   000    | 6MHz/12 = 0.5MHz      |  1.95 kHz
- *   PCA_CLK_2    |   001    | 6MHz/2  = 3MHz         | 11.7  kHz
- *   PCA_CLK_T0   |   010    | T0溢出频率              | 用户定义
- *   PCA_CLK_ECI  |   011    | 外部ECI引脚输入          | 用户定义
- *   PCA_CLK_1    |   100    | 6MHz/1  = 6MHz         | 23.4  kHz  ← 本例使用
- *   PCA_CLK_4    |   101    | 6MHz/4  = 1.5MHz       |  5.86 kHz
- *   PCA_CLK_6    |   110    | 6MHz/6  = 1MHz         |  3.9  kHz
- *   PCA_CLK_8    |   111    | 6MHz/8  = 0.75MHz      |  2.93 kHz
- *
- * STC8G1K08A CCP引脚映射（P_SW1[5:4] = CCP_S[1:0]，依据官方手册）：
- *   CCP_S | CCP0  | CCP1  | CCP2
- *   -------|-------|-------|------
- *    00   | P3.2  | P3.3  | P5.4   ← 本例选用（CCP_S=00，上电默认值）
- *    01   | P3.1  | P3.3  | P5.4
- *    10   | P3.2  | P3.3  | P5.5
- *
- * 引脚选择分析：
- *   - P3.2 已用作 INT0 按键输入，CCP0 在 CCP_S=00/10 均冲突
- *   - P3.0/P3.1 预留 UART，CCP0 在 CCP_S=01 亦冲突
- *   - CCP1 在三种映射中始终指向 P3.3（SOP8 Pin 8），为唯一可用的CCP输出引脚
- *   - 选择 CCP_S=00（P_SW1[5:4]=00，即上电复位默认值），无需修改P_SW1寄存器
- *******************************************************************************/
-#define PCA_CLK_12    0x00   /* CMOD[3:1]=000, SYSCLK/12 */
-#define PCA_CLK_2     0x02   /* CMOD[3:1]=001, SYSCLK/2  */
-#define PCA_CLK_T0    0x04   /* CMOD[3:1]=010, Timer0溢出 */
-#define PCA_CLK_ECI   0x06   /* CMOD[3:1]=011, 外部ECI输入 */
-#define PCA_CLK_1     0x08   /* CMOD[3:1]=100, SYSCLK/1  ← 本例：6MHz→PWM≈23.4kHz */
-#define PCA_CLK_4     0x0A   /* CMOD[3:1]=101, SYSCLK/4  */
-#define PCA_CLK_6     0x0C   /* CMOD[3:1]=110, SYSCLK/6  */
-#define PCA_CLK_8     0x0E   /* CMOD[3:1]=111, SYSCLK/8  */
+static uint64_t idle_time_acc = 0;
+static uint64_t last_report_time = 0;
 
-/* 降频补偿：SYSCLK=6MHz，PCA时钟选 SYSCLK/1=6MHz → PWM频率≈23.4kHz不变         */
-/* （原24MHz时：若选FOSC/4=6MHz；降为6MHz后：选SYSCLK/1=6MHz，PCA时钟完全相同） */
-#define PCA_CLK_SEL   PCA_CLK_1
-#endif /* USE_HW_PWM — PCA宏定义 */
+static volatile int curScanline = 0;
 
-/*******************************************************************************
- * ③ 低功耗模式宏定义
- *
- * STC8G1K08A 支持两种低功耗模式（通过 PCON 寄存器控制）：
- *
- *   模式        | PCON位 | CPU  | 外设时钟 | PCA运行 | Timer运行 | 典型唤醒源
- *   ------------|--------|------|----------|---------|-----------|------------
- *   IDLE(空闲)  | IDL=1  | 停止 | 继续运行 | 是      | 是        | 任意中断
- *   STOP(停机)  | PD=1   | 停止 | 全部停止 | 否      | 否        | 外部中断
- *
- * 结论：PWM期间只能使用 IDLE 模式。
- *   PCA在IDLE下继续自主输出硬件PWM（P3.3）；
- *   Timer0在IDLE下继续产生溢出中断，驱动软件PWM（P5.5）。
- *   STOP模式停止所有时钟，PCA和Timer0均停止，PWM波形立即消失，不适用。
- *
- * PCON 寄存器（SFR地址 0x87）各位说明：
- *   bit7 SMOD  - 串口波特率加倍（与低功耗无关，保持原值）
- *   bit1 PD    - 置1进入STOP停机模式（慎用！此模式PWM停止）
- *   bit0 IDL   - 置1进入IDLE空闲模式
- *   注：IDL和PD同时写1时，PD优先进入STOP模式，请勿误操作。
- *
- * CMOD.CIDL（bit7）控制IDLE时PCA是否继续运行：
- *   CIDL=0 → PCA在IDLE下继续计数（本例已在PWM_Init中将CMOD bit7清零）
- *   CIDL=1 → PCA在IDLE下暂停，P3.3上的硬件PWM停止输出
- *******************************************************************************/
 
-/* 进入IDLE模式指令：将 PCON 的 IDL 位(bit0)置1                            */
-/* 使用 |= 而非赋值，保留 SMOD 等其他位的原有值，避免误改串口波特率等配置   */
-#define ENTER_IDLE()    (PCON |= 0x01)
+static void callbackVBL(){
+    ST7789_Prepare(
+        Setting_GetSettingData()->rotation,
+        Setting_GetSettingData()->colorOrder,
+        Setting_GetSettingData()->winX[Setting_GetSettingData()->style],
+        Setting_GetSettingData()->winY[Setting_GetSettingData()->style],
+        Setting_GetSettingData()->winW[Setting_GetSettingData()->style],
+        Setting_GetSettingData()->winH[Setting_GetSettingData()->style]
+    );
+    curScanline = 0;
+    // 息屏计数器喂狗，同时点亮背光
+    Backlight_Feed();
+}
+static void callbackHBL(uint16_t* _buffer, uint32_t _size){
+    // 绘制该条扫描线
+    ST7789_Transfer((void*)_buffer, _size);
+    // // 奇数行的处理策略
+    // if(curScanline & 1){
+    //     if(Setting_GetSettingData()->style == Style_Scanline){
+    //         // 绘制灰色扫描线
+    //         ST7789_Transfer((void*)scanlineColors, _size);
+    //     }else if(Setting_GetSettingData()->style == Style_FullScreen){
+    //         // 重复绘制该条扫描线
+    //         ST7789_Transfer((void*)_buffer, _size);
+    //     }
+    // }
 
-/*******************************************************************************
- * ③ 外部中断输入配置（INT0 @ P3.2）
- *
- * 引脚选择依据：
- *   SOP8封装的8个引脚中，P3.2(Pin 7)尚未被PWM占用，且是STC8G的INT0专用引脚，
- *   无需额外软件轮询即可通过硬件中断检测边沿，适合低功耗唤醒场景。
- *
- *   STC8G INT0 边沿检测说明（与传统8051不同）：
- *   经典8051中，IT0=1仅响应下降沿；
- *   STC8G增强后，IT0=1时 INT0 同时响应上升沿和下降沿（两边沿均触发中断）。
- *   因此，在INT0_ISR中读取KEY_PIN当前电平即可区分边沿方向：
- *     KEY_PIN == 1 → 引脚当前为高 → 刚发生上升沿 → 执行换档
- *     KEY_PIN == 0 → 引脚当前为低 → 刚发生下降沿 → 忽略
- *
- * 按键接线方式：
- *   P3.2 ─── [按键] ─── GND
- *   （准双向口模式内置弱上拉，引脚空闲时为高；按键按下时拉低，
- *     松开时恢复高电平，即产生一个上升沿，触发换档）
- *
- * 消抖策略：
- *   检测到上升沿后立即禁用EX0（INT0使能位），防止弹跳噪声再次触发，
- *   设置标志位后由main()处理换档，等待 KEY_DEBOUNCE_MS 毫秒后重新使能EX0。
- ******************************************************************************/
+    curScanline++;
+}
+static const struct Capture_config capture_config = {
+    .callbackVBL = callbackVBL,
+    .callbackHBL = callbackHBL,
+};
 
-/* 按键输入位变量：P3.2（SOP8 Pin 7，INT0引脚）                             */
-/* Keil C51中 P32 是 STC8G.H 或 REG51.H 等头文件中定义的 P3.2 位变量       */
-#define KEY_PIN         P32
 
-/* 按键消抖时长（单位：调用Delay_ms()的毫秒参数）                           */
-/* 注意：Delay_ms()基于空循环，在SYSCLK=6MHz下实际耗时约为标称值的4倍，     */
-/* 但20ms×4=80ms仍在按键消抖的合理范围（10ms~200ms）内，无需精确对齐。      */
-#define KEY_DEBOUNCE_MS 20
+int main()
+{
+    stdio_init_all();
 
-/*******************************************************************************
- * ④ PWM配置（硬件/软件共用参数）
- *******************************************************************************/
+    pico_unique_board_id_t boardId;
+    pico_get_unique_board_id(&boardId);
+    printf("UniqueId=%02X%02X%02X%02X%02X%02X%02X%02X\n", boardId.id[0], boardId.id[1], boardId.id[2], boardId.id[3], boardId.id[4], boardId.id[5], boardId.id[6], boardId.id[7]);
 
-/* PWM输出引脚：P3.3（SOP8 Pin 8），硬件和软件PWM统一使用此引脚 */
-#define PWM_PIN      P33          /* Keil C51 位变量，对应 P3.3 */
+    printf("System Clock=%fkHz\n", clock_get_hz(clk_sys) / 1000.0f);
 
-/* 软件PWM分辨率：11档（0%/10%/20%/.../90%/100%，步长10%）
- * 每个PWM周期由 PWM_STEPS=10 个Timer0中断构成：
- *   sw_pwm_cnt 在 0~9 循环，sw_pwm_duty 取值 0~10
- *   当 sw_pwm_cnt < sw_pwm_duty 时输出高电平，否则输出低电平
- *
- * 档位对照表（sw_pwm_duty 值 → 高电平步数 → 占空比）：
- *   档位宏           | sw_pwm_duty | 高电平步数 | 占空比
- *   PWM_GEAR_0    |      0      |     0      |   0%
- *   PWM_GEAR_10   |      1      |     1      |  10%
- *   PWM_GEAR_20   |      2      |     2      |  20%
- *   PWM_GEAR_30   |      3      |     3      |  30%
- *   PWM_GEAR_40   |      4      |     4      |  40%
- *   PWM_GEAR_50   |      5      |     5      |  50%
- *   PWM_GEAR_60   |      6      |     6      |  60%
- *   PWM_GEAR_70   |      7      |     7      |  70%
- *   PWM_GEAR_80   |      8      |     8      |  80%
- *   PWM_GEAR_90   |      9      |     9      |  90%
- *   PWM_GEAR_100  |     10      |    10      | 100% */
-#define PWM_STEPS    10
+    // 超频到160MHz
+    // set_sys_clock_khz(160000, true);
 
-/* 档位宏：直接传入 PWM_SetGear()，或通过 PWM_SetDuty() 百分比自动匹配 */
-#define PWM_GEAR_0     0   /* 占空比 0%  （全低电平） */
-#define PWM_GEAR_10    1   /* 占空比10% */
-#define PWM_GEAR_20    2   /* 占空比20% */
-#define PWM_GEAR_30    3   /* 占空比30% */
-#define PWM_GEAR_40    4   /* 占空比40% */
-#define PWM_GEAR_50    5   /* 占空比50% */
-#define PWM_GEAR_60    6   /* 占空比60% */
-#define PWM_GEAR_70    7   /* 占空比70% */
-#define PWM_GEAR_80    8   /* 占空比80% */
-#define PWM_GEAR_90    9   /* 占空比90% */
-#define PWM_GEAR_100  10   /* 占空比100%（全高电平） */
+    stdio_init_all();
 
-#ifndef USE_HW_PWM
-/* 软件PWM每步定时器重载值（Timer0，16位自动重载 + 1T模式，仅软件PWM模式使用）
- *   每步时间 = SW_PWM_STEP_US 微秒
- *   整个PWM周期 = PWM_STEPS × SW_PWM_STEP_US = 10 × 1000 = 10000us = 10ms
- *   对应PWM频率 = 100 Hz（与旧版完全相同，仅分辨率变为10%步长）
- *
- * Timer0 1T模式重载值 = 65536 - (SYSCLK / 目标中断频率)
- *   目标中断频率 = 1,000,000 / SW_PWM_STEP_US = 1000 Hz（每1000us一次）
- *   重载值 = 65536 - (6,000,000 / 1000) = 65536 - 6000 = 59536 = 0xE890
- *
- * 降低分辨率带来的额外节能：
- *   步数从100→10，Timer0中断频率从10kHz→1kHz，降低10倍。
- *   CPU因中断而唤醒的频率同步降低，IDLE休眠占比进一步提高。
- *   （每1000us唤醒一次约5us，CPU运行占比仅约0.5%）                        */
-#define SW_PWM_STEP_US   1000                             /* 每步1000微秒 */
-#define T0_RELOAD   (65536 - (SYSCLK / (1000000 / SW_PWM_STEP_US)))
-#define T0H_RELOAD  ((unsigned char)(T0_RELOAD >> 8))    /* 重载值高字节 */
-#define T0L_RELOAD  ((unsigned char)(T0_RELOAD & 0xFF))  /* 重载值低字节 */
-#endif /* !USE_HW_PWM — Timer0重载值宏 */
+    printf("Overclocked System Clock=%fkHz\n", clock_get_hz(clk_sys) / 1000.0f);
 
-/*******************************************************************************
- * ⑤ EEPROM(IAP)配置 — 档位掉电保存
- *
- * STC8G1K08A内置EEPROM（通过IAP指令访问），可在掉电前保存当前档位，
- * 下次上电后自动恢复到上次保存的档位。
- *
- * IAP操作特点：
- *   - 扇区大小512字节，擦除以扇区为单位，写入以字节为单位
- *   - 写入只能将位从1→0，要将0→1必须先擦除整个扇区（擦除后全部变为0xFF）
- *   - 典型擦写寿命：10万次（对于PWM档位切换场景完全足够）
- *
- * 数据格式（使用IAP地址空间扇区0的前2个字节）：
- *   地址0x0000: 魔数(EEPROM_MAGIC)，用于校验数据有效性
- *   地址0x0001: 保存的档位值(0~10)
- *   全新芯片或首次烧录后，EEPROM全为0xFF，魔数不匹配→使用默认档位50%
- *
- * IAP寄存器（STC8G系列）：
- *   IAP_DATA  (0xC2) - 数据寄存器（读出/写入的字节）
- *   IAP_ADDRH (0xC3) - 地址高字节
- *   IAP_ADDRL (0xC4) - 地址低字节
- *   IAP_CMD   (0xC5) - 命令寄存器：0=待机, 1=读, 2=写, 3=扇区擦除
- *   IAP_TRIG  (0xC6) - 触发寄存器：先写0x5A再写0xA5执行命令
- *   IAP_CONTR (0xC7) - 控制寄存器：bit7=IAPEN(使能)
- *   IAP_TPS   (0xF5) - 等待参数：设为SYSCLK的MHz值（STC8G特有）
- *******************************************************************************/
+    // 保留UART、SPI、PIO、DMA、GPIO、PWM、ADC、Timer硬件时钟，关闭USB、I2C、RTC
+    clock_stop(clk_usb);
+    reset_block(
+        RESETS_RESET_I2C0_BITS |
+        RESETS_RESET_I2C1_BITS |
+        RESETS_RESET_RTC_BITS |
+        RESETS_RESET_USBCTRL_BITS |
+        0
+    );
+    clocks_hw->clk[clk_sys].ctrl &= ~RESETS_RESET_I2C0_BITS;
+    clocks_hw->clk[clk_sys].ctrl &= ~RESETS_RESET_I2C1_BITS;
+    clock_stop(clk_rtc);
 
-/* EEPROM存储地址（IAP地址空间，扇区0起始处） */
-#define EEPROM_SECTOR_ADDR  0x0000   /* 扇区0首地址（擦除时使用，512字节对齐） */
-#define EEPROM_MAGIC_ADDR   0x0000   /* 魔数存储地址 */
-#define EEPROM_GEAR_ADDR    0x0001   /* 档位存储地址 */
-#define EEPROM_MAGIC        0xA5     /* 魔数：数据有效性标记 */
+    // 初始化存档
+    Setting_Init();
 
-/* IAP等待参数：STC8G系列使用IAP_TPS寄存器，值=系统时钟MHz数 */
-#define IAP_TPS_VAL         ((unsigned char)(SYSCLK / 1000000UL))  /* 6 */
+    // 初始化电压监视器
+    BatMonitor_Init();
 
-/* 若STC8G.H版本较旧未定义IAP_TPS，请取消以下注释 */
-/* sfr IAP_TPS = 0xF5; */
+    // 初始化lcd
+    ST7789_Init();
 
+    // 设置边框
+    ST7789_DMAWaitForIdle();
+    ST7789_Prepare(
+        Setting_GetSettingData()->rotation,
+        Setting_GetSettingData()->colorOrder,
+        Setting_GetSettingData()->winX[Style_FullScreen],
+        Setting_GetSettingData()->winY[Style_FullScreen],
+        Setting_GetSettingData()->winW[Style_FullScreen],
+        Setting_GetSettingData()->winH[Style_FullScreen]
+    );
+    ST7789_DMAWaitForIdle();
+    ST7789_Transfer(borders[0], Setting_GetSettingData()->winW[Style_FullScreen] * Setting_GetSettingData()->winH[Style_FullScreen] * sizeof(uint16_t));
+    ST7789_DMAWaitForIdle();
+    ST7789_Prepare(
+        Setting_GetSettingData()->rotation,
+        Setting_GetSettingData()->colorOrder,
+        Setting_GetSettingData()->winX[Style_Classic],
+        Setting_GetSettingData()->winY[Style_Classic],
+        Setting_GetSettingData()->winW[Style_Classic],
+        Setting_GetSettingData()->winH[Style_Classic]
+    );
+    ST7789_DMAWaitForIdle();
+
+    // 初始化触摸按键
+    Touch_Init();
+
+    // 初始化capture
+    // Capture_Init(&capture_config);
+
+    // 初始化背光灯
+    Backlight_Init();
+
+    // 设置背光亮度
+    Backlight_Set(Setting_GetSettingData()->backlight);
+
+    ST7789_Prepare(
+        Setting_GetSettingData()->rotation,
+        Setting_GetSettingData()->colorOrder,
+        0,
+        0,
+        8,
+        8
+    );
+
+    uint16_t tmp[8 * 8] = {[0 ... 63] = 0};
+    uint16_t tmp2[8 * 8] = {[0 ... 63] = 0xFFFF};
+    last_report_time = to_us_since_boot(get_absolute_time());
+    while (true) {
+        // 睡眠
+        __wfi();
+
+        if(Touch_IsTouched())
+            ST7789_Transfer(tmp, 8 * 8 * sizeof(uint16_t));
+        else
+            ST7789_Transfer(tmp2, 8 * 8 * sizeof(uint16_t));
+
+        // 每秒显示点啥
+        uint64_t t = to_us_since_boot(get_absolute_time());
+        if(t - last_report_time >= 1000000){
+            last_report_time = t;
+            printf("Voltage=%fV\n", BatMonitor_GetValue());
+        }
+    }
+}
